@@ -197,6 +197,8 @@ if run:
     # 4) Stage-1: GNews sentiment for all prefiltered tickers
     total_news = len(f)
 
+    gnews_errors: list[str] = []
+
     def gnews_progress(done: int, total: int, ticker: str | None = None) -> None:
         total = max(1, int(total))
         done = int(done)
@@ -214,11 +216,12 @@ if run:
             aliases=config.ALIASES,
             gnews_api_key=GNEWS_API_KEY,
             lookback_days_news=int(lookback_news),
-            max_articles_per_ticker=20,
+            max_articles_per_ticker=10,
             cache=cache,
             ttl_seconds=config.CACHE_TTL_SECONDS,
             max_workers=int(gdelt_workers),
             progress_cb=gnews_progress,
+            error_log=gnews_errors,
         )
 
     merged = f.merge(gnews_df, on="ticker", how="left")
@@ -296,6 +299,8 @@ if run:
     set_progress(92, "Rendering results...")
 
     st.subheader(f"Top {top_n} candidates")
+    if gnews_errors:
+        st.warning("\n".join(gnews_errors))
     if advanced_mode:
         show_cols = [
             "ticker",
@@ -351,6 +356,7 @@ if run:
                 cache=cache,
                 ttl_seconds=config.CACHE_TTL_SECONDS,
                 lang="en",
+                errors=gnews_errors,
             )
 
             with st.expander(f"{t}", expanded=False):
