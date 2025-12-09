@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Envs
+.env
+.venv/
+venv/
+conda/
+
+# Streamlit/cache
+.streamlit/
+.cache/
+cache/
+disk_cache/
+*.sqlite
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
