@@ -325,7 +325,6 @@ def fetch_prices(
     return combo, source_map
 
 
-
 def load_prices_from_csv(
     path: Path, tickers_jk: list[str], lookback_days_price: int
 ) -> tuple[pd.DataFrame, dict[str, str]]:
@@ -376,7 +375,11 @@ def normalize_price_frame(df: pd.DataFrame) -> pd.DataFrame:
     ticker, date, close[, volume]. Returns an empty frame when unusable.
     """
 
-    if df is None or df.empty:
+    if isinstance(df, tuple):
+        # Defensive: callers sometimes pass (df, src_map)
+        df = df[0] if df else None
+
+    if not isinstance(df, pd.DataFrame) or df is None or df.empty:
         return pd.DataFrame()
 
     out = df.copy()
@@ -407,3 +410,54 @@ def normalize_price_frame(df: pd.DataFrame) -> pd.DataFrame:
     out["ticker"] = out["ticker"].astype(str).str.strip()
     out = out.sort_values(["ticker", "date"]).reset_index(drop=True)
     return out
+
+
+def fetch_prices_infosaham_style(
+    tickers_jk: list[str], lookback_days_price: int
+) -> tuple[pd.DataFrame, dict[str, str], list[str]]:
+    """Best-effort sequential fetch that mirrors the infoSaham scraper style.
+
+    This uses yfinance per ticker (serially) to reduce rate-limit pressure and
+    returns a normalized long dataframe plus a source map labelled "infosaham".
+    It is intentionally tolerant of per-ticker failures and reports them back
+    to the caller.
+    """
+
+    tickers_jk = sorted(set([t for t in tickers_jk if t]))
+    if not tickers_jk:
+        return pd.DataFrame(), {}, []
+
+    frames: list[pd.DataFrame] = []
+    src_map: dict[str, str] = {t: "none" for t in tickers_jk}
+    failures: list[str] = []
+    start = datetime.utcnow() - timedelta(days=int(lookback_days_price) + 3)
+
+    for t in tickers_jk:
+        try:
+            df = yf.download(
+                tickers=t,
+                period=f"{int(lookback_days_price)}d",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )
+        except Exception as e:  # pragma: no cover - defensive network guard
+            failures.append(f"{t}: {e}")
+            continue
+
+        norm = normalize_price_frame(_normalize_yf_download(df, [t]))
+        if norm.empty:
+            failures.append(f"{t}: no data returned")
+            continue
+
+        norm = norm[norm["date"] >= pd.Timestamp(start)]
+        if norm.empty:
+            failures.append(f"{t}: no rows within lookback")
+            continue
+
+        frames.append(norm)
+        src_map[t] = "infosaham"
+
+    combo = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return combo, src_map, failures

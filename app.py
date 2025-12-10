@@ -16,9 +16,8 @@ from data_gdelt import (
     fetch_latest_headlines as fetch_gdelt_headlines,
 )
 from data_gnews import fetch_latest_headlines
-from data_prices import load_prices_from_csv, normalize_price_frame, fetch_prices
+from data_prices import load_prices_from_csv
 from data_x import build_x_query, fetch_x_posts
-# from data_yahoo import fetch_prices_fast
 from scoring import (
     compute_price_features,
     fetch_gnews_for_universe,
@@ -28,6 +27,10 @@ from scoring import (
 )
 from data_idx import fetch_idx_prices
 
+
+ROOT_DIR = Path(__file__).resolve().parent
+LOCAL_PRICE_CSV_PATH = ROOT_DIR / "data" / "price_idx.csv"
+PORTFOLIO_CSV_PATH = ROOT_DIR / "data" / "portfolio.csv"
 
 ROOT_DIR = Path(__file__).resolve().parent
 LOCAL_PRICE_CSV_PATH = ROOT_DIR / "data" / "price_idx.csv"
@@ -44,6 +47,7 @@ cache = DiskCache(ROOT_DIR / ".cache")
 
 st.title("IDX Sentiment Screener")
 st.caption("News-driven ranking with optional CSV prices and disk caching.")
+
 
 
 def load_latest_prices(path: Path) -> pd.DataFrame:
@@ -99,12 +103,11 @@ with st.sidebar:
     price_source = st.selectbox(
         "Price data",
         [
-            "Live (yfinance + save to CSV)",
-            "From CSV only (offline)",
+            "From CSV (offline)",
             "Skip prices (sentiment-only)",
         ],
         index=0,
-        help="Choose whether to pull fresh yfinance data, read cached CSV prices, or skip prices altogether.",
+        help="Read cached CSV prices or skip prices entirely.",
     )
 
     st.subheader("Ranking")
@@ -208,83 +211,6 @@ def _filter_prices_by_lookback(df: pd.DataFrame, lookback_days_price: int) -> pd
     return df[df["date"] >= start]
 
 
-def fetch_live_prices_and_cache(
-    tickers_jk: list[str], lookback_days_price: int, cache: DiskCache
-) -> tuple[pd.DataFrame, dict[str, str], str | None]:
-    """
-    Fetch prices from Yahoo Finance with IDX backup, normalize them,
-    persist to CSV, and return (df, src_map, error_message).
-    """
-
-    tickers_jk = sorted(set([t for t in tickers_jk if t]))
-    if not tickers_jk:
-        return pd.DataFrame(), {}, "No tickers supplied."
-
-    try:
-        df_raw, src_raw = fetch_prices(
-            tickers_jk=tickers_jk,
-            lookback_days_price=int(lookback_days_price),
-            cache=cache,
-            ttl_seconds=config.CACHE_TTL_SECONDS,
-            mode="yahoo_fallback_idx",
-        )
-    except Exception as e:  # defensive UI guard
-        return (
-            pd.DataFrame(),
-            _build_src_map(tickers_jk, set(), "live"),
-            f"Price fetch failed (Yahoo + IDX): {e}",
-        )
-
-    df_norm = normalize_price_frame(df_raw)
-    if df_norm is None or df_norm.empty:
-        return (
-            pd.DataFrame(),
-            _build_src_map(tickers_jk, set(), "live"),
-            "No usable price data returned from Yahoo/IDX.",
-        )
-
-    df_norm = df_norm[df_norm["ticker"].isin(tickers_jk)]
-    df_norm = _filter_prices_by_lookback(df_norm, lookback_days_price)
-
-    # Source map: use underlying source_map from fetch_prices
-    src_map = {t: src_raw.get(t, "none") for t in tickers_jk}
-    present = (
-        set(
-            df_norm.get("ticker", pd.Series(dtype=str))
-            .dropna()
-            .astype(str)
-            .unique()
-        )
-        if not df_norm.empty
-        else set()
-    )
-    for t in present:
-        if t in src_map and src_map[t] == "none":
-            src_map[t] = "live"
-
-    if df_norm.empty:
-        return (
-            pd.DataFrame(),
-            src_map,
-            "No usable price rows after filtering by lookback.",
-        )
-
-    # Persist to CSV for offline mode / portfolio
-    try:
-        LOCAL_PRICE_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
-        df_norm.to_csv(LOCAL_PRICE_CSV_PATH, index=False)
-    except Exception as e:
-        return (
-            df_norm,
-            src_map,
-            f"Saved live data in memory but failed to write CSV: {e}",
-        )
-
-    return df_norm, src_map, None
-
-
-
-
 tab_screener, tab_scraper, tab_portfolio = st.tabs([
     "Screener",
     "Prices & Scraper",
@@ -325,7 +251,7 @@ with tab_screener:
 
         if price_source == "Skip prices (sentiment-only)":
             sentiment_only_mode = True
-        elif price_source == "From CSV only (offline)":
+        else:
             price_df, src_map = load_prices_from_csv(
                 path=LOCAL_PRICE_CSV_PATH,
                 tickers_jk=tickers_jk,
@@ -333,14 +259,10 @@ with tab_screener:
             )
             sentiment_only_mode = price_df.empty
             if sentiment_only_mode:
-                price_error = "No usable price data in price_idx.csv; falling back to sentiment-only mode."
-        else:  # Live fetch
-            price_df, src_map, price_error = fetch_live_prices_and_cache(
-                tickers_jk=tickers_jk,
-                lookback_days_price=int(lookback_price),
-                cache=cache,
-            )
-            sentiment_only_mode = price_df.empty
+                price_error = (
+                    "No usable price data in price_idx.csv. Run `python update_prices_yahoo.py` "
+                    "to refresh prices or switch to sentiment-only."
+                )
 
         src_counts = pd.Series(list(src_map.values())).value_counts() if src_map else pd.Series()
         st.info(
@@ -592,7 +514,7 @@ with tab_screener:
 
         st.dataframe(
             ranked[show_cols].head(int(top_n)),
-            use_container_width=True,
+            width="stretch",
         )
 
         # 8) Headlines (from GNews)
@@ -697,66 +619,26 @@ with tab_screener:
 # Prices & Scraper tab
 # ----------------------------
 with tab_scraper:
-    st.subheader("Update local price CSV")
-    st.markdown(
-        "Fetch prices from Yahoo Finance with IDX backup and overwrite "
-        "the local CSV (`data/price_idx.csv`) used by the screener and portfolio."
+    st.subheader("Prices & Scraper (offline updater)")
+    st.write(
+        "Prices are loaded from `data/price_idx.csv`. Use the CLI script to refresh "
+        "prices without hammering Yahoo:"
     )
+    st.code("python update_prices_yahoo.py --lookback 180")
 
-    scrape_universe_text = st.text_area(
-        "Tickers to scrape (IDX, one per line, no .JK)",
-        value="\n".join(config.WATCHLIST),
-        height=180,
-    )
-    scrape_tickers = [
-        t.strip().upper() for t in scrape_universe_text.splitlines() if t.strip()
-    ]
-    scrape_tickers_jk = [f"{t}.JK" for t in scrape_tickers]
+    st.write("Watchlist tickers used by the CLI:")
+    st.text("\n".join(config.WATCHLIST))
 
-    scrape_lookback = st.number_input(
-        "Price lookback for scraping (days)",
-        min_value=10,
-        max_value=365,
-        value=config.LOOKBACK_DAYS_PRICE_DEFAULT,
-        step=5,
-    )
-
-    run_scrape = st.button("Run scrape & overwrite prices CSV", type="primary")
-
-    if run_scrape:
-        if not scrape_tickers_jk:
-            st.warning("Please enter at least one ticker.")
-        else:
-            with st.spinner(
-                "Fetching prices via Yahoo + IDX backup and saving to CSV..."
-            ):
-                df_live, src_live, err_live = fetch_live_prices_and_cache(
-                    tickers_jk=scrape_tickers_jk,
-                    lookback_days_price=int(scrape_lookback),
-                    cache=cache,
-                )
-
-            if err_live:
-                st.warning(err_live)
-
-            if df_live is None or df_live.empty:
-                st.error("No price data returned from Yahoo/IDX.")
-            else:
-                st.success(
-                    f"Saved {len(df_live)} rows for {df_live['ticker'].nunique()} "
-                    f"tickers to {LOCAL_PRICE_CSV_PATH}"
-                )
-                st.dataframe(df_live.tail(20), use_container_width=True)
-
-    if LOCAL_PRICE_CSV_PATH.exists():
-        st.markdown("**Current local price CSV (preview):**")
+    prices_path = LOCAL_PRICE_CSV_PATH
+    if prices_path.exists():
+        st.markdown("### Current price_idx.csv (last 20 rows)")
         try:
-            preview = pd.read_csv(LOCAL_PRICE_CSV_PATH)
-            st.dataframe(preview.tail(20), use_container_width=True)
-        except Exception as e:
-            st.warning(f"Could not read existing CSV: {e}")
-
-
+            preview = pd.read_csv(prices_path)
+            st.dataframe(preview.tail(20), width="stretch")
+        except Exception as e:  # pragma: no cover - UI safety
+            st.error(f"Failed to read existing CSV: {e}")
+    else:
+        st.info("price_idx.csv not found yet. Run `python update_prices_yahoo.py` to generate it.")
 
 
 # ----------------------------
@@ -785,7 +667,7 @@ with tab_portfolio:
     edited = st.data_editor(
         portfolio_df,
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         key="portfolio_editor",
     )
 
@@ -859,7 +741,7 @@ with tab_portfolio:
                         "pnl_pct",
                     ]
                 ],
-                use_container_width=True,
+                width="stretch",
             )
     else:
         st.info("Add holdings above to see P&L against price_idx.csv.")
