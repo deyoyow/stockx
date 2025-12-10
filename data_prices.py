@@ -4,12 +4,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple
+from cache_disk import DiskCache
+from data_idx import fetch_idx_prices  # <-- add this line
 
+import time
 import pandas as pd
 import yfinance as yf
-
-from cache_disk import DiskCache
-
 
 def _normalize_yf_download(df: pd.DataFrame, tickers_jk: list[str]) -> pd.DataFrame:
     if df is None or df.empty:
@@ -104,18 +104,23 @@ def fetch_prices(
     lookback_days_price: int,
     cache: DiskCache,
     ttl_seconds: int,
-    mode: str = "yahoo_fallback_stooq",  # "yahoo", "stooq", "yahoo_fallback_stooq"
+    mode: str = "yahoo_fallback_stooq",  # also supports "yahoo_fallback_idx"
     yf_threads: bool = True,
     stooq_overrides: Dict[str, str] | None = None,
 ) -> Tuple[pd.DataFrame, Dict[str, str]]:
     """
+    Fetch prices with Yahoo as primary, optional IDX and/or Stooq fallback.
+
     Returns:
-      - price_df: normalized long dataframe with columns including Date/open/high/low/close/volume/ticker
-      - source_map: { "BBCA.JK": "yahoo" | "stooq" | "none" }
+      - price_df: long-format dataframe (any columns; will be normalized later)
+      - source_map: { "BBCA.JK": "yahoo" | "idx" | "stooq" | "none" }
 
     Notes:
-    - Yahoo can rate-limit by IP. Stooq may not have IDX tickers. This is best-effort fallback.
+    - Yahoo is called in batches of 10 tickers to reduce rate-limit issues.
+    - When mode is 'yahoo_fallback_idx', only missing tickers go to IDX.
+    - When mode is 'yahoo_fallback_stooq', only missing tickers go to Stooq.
     """
+    # -------- 0) Clean inputs --------
     tickers_jk = [t.strip() for t in tickers_jk if t and str(t).strip()]
     tickers_jk = sorted(set(tickers_jk))
     if not tickers_jk:
@@ -124,96 +129,201 @@ def fetch_prices(
     stooq_overrides = stooq_overrides or {}
     source_map: Dict[str, str] = {t: "none" for t in tickers_jk}
 
-    # Cache key should NOT depend on UI knobs like threads
-    key = f"prices|mode={mode}|days={int(lookback_days_price)}|tickers={' '.join(tickers_jk)}"
+    # Cache key does not depend on threads or other transient options
+    key = (
+        f"prices|mode={mode}|days={int(lookback_days_price)}|"
+        f"tickers={' '.join(tickers_jk)}"
+    )
     cached = cache.get("prices_combo", key, ttl_seconds=ttl_seconds)
     if isinstance(cached, dict) and "df" in cached and "src" in cached:
-        df_cached = cached["df"]
-        src_cached = cached["src"]
+        df_cached = cached.get("df")
+        src_cached = cached.get("src")
         if isinstance(df_cached, pd.DataFrame) and isinstance(src_cached, dict):
             return df_cached, src_cached
 
     out_frames: list[pd.DataFrame] = []
+    missing_after_yahoo = list(tickers_jk)  # default if Yahoo not used
 
-    # 1) Yahoo attempt
-    missing_after_yahoo = tickers_jk[:]
-    if mode in ("yahoo", "yahoo_fallback_stooq"):
-        try:
-            df = yf.download(
-                tickers=" ".join(tickers_jk),
-                period=f"{int(lookback_days_price)}d",
-                interval="1d",
-                auto_adjust=True,
-                group_by="ticker",
-                progress=False,
-                threads=bool(yf_threads),
+    # -------- 1) Yahoo (primary) --------
+    if mode in ("yahoo", "yahoo_fallback_stooq", "yahoo_fallback_idx"):
+        got_yahoo: set[str] = set()
+
+        # Call yfinance in batches of 10 tickers
+        batch_size = 1
+        for i in range(0, len(tickers_jk), batch_size):
+            batch = tickers_jk[i : i + batch_size]
+            if not batch:
+                continue
+
+            # Extra margin on lookback days to cover weekends/holidays
+            margin_days = 3
+            period_days = int(max(lookback_days_price + margin_days, 10))
+
+            try:
+                df_raw = yf.download(
+                    tickers=batch,
+                    period=f"{period_days}d",
+                    interval="1d",
+                    group_by="ticker",
+                    auto_adjust=False,
+                    threads=yf_threads,
+                    progress=False,
+                )
+            except Exception as e:
+                # If it's a rate-limit, stop hammering Yahoo and break;
+                # fallback sources will take over for everyone.
+                if _is_yahoo_rate_limit_error(e):
+                    break
+                # For non-rate-limit errors, just skip this batch
+                continue
+
+            df_norm = _normalize_yf_download(df_raw, batch)
+            if df_norm is None or df_norm.empty:
+                continue
+
+            # Filter to lookback window
+            start = pd.Timestamp.utcnow() - pd.Timedelta(
+                days=int(lookback_days_price) + 3
             )
-            norm = _normalize_yf_download(df, tickers_jk)
-        except Exception as e:
-            norm = pd.DataFrame()
-            # Mark yahoo failure for all, we will fallback if allowed
-            if not _is_yahoo_rate_limit_error(e):
-                # still allow fallback, but this hints a different issue
-                pass
+            if "Date" in df_norm.columns:
+                df_norm = df_norm[df_norm["Date"] >= start]
 
-        if norm is not None and not norm.empty:
-            # Determine which tickers succeeded
-            got = set(norm["ticker"].dropna().astype(str).unique().tolist())
-            for t in tickers_jk:
-                if t in got:
-                    source_map[t] = "yahoo"
-            out_frames.append(norm)
-            missing_after_yahoo = [t for t in tickers_jk if t not in got]
+            if df_norm.empty:
+                continue
 
+            out_frames.append(df_norm)
+
+            present_batch = (
+                df_norm.get("ticker", pd.Series(dtype=str))
+                .dropna()
+                .astype(str)
+                .unique()
+                .tolist()
+            )
+            for t in present_batch:
+                got_yahoo.add(t)
+
+        # Update source map for those which Yahoo actually returned
+        for t in got_yahoo:
+            if t in source_map:
+                source_map[t] = "yahoo"
+
+        missing_after_yahoo = [t for t in tickers_jk if t not in got_yahoo]
+
+        # If user requested Yahoo only, we're done here
         if mode == "yahoo":
-            combo = pd.concat(out_frames, ignore_index=True) if out_frames else pd.DataFrame()
+            combo = (
+                pd.concat(out_frames, ignore_index=True)
+                if out_frames
+                else pd.DataFrame()
+            )
             cache.set("prices_combo", key, {"df": combo, "src": source_map})
             return combo, source_map
 
-    # 2) Stooq fallback (only missing tickers)
+    # -------- 2) IDX fallback (for missing tickers or whole universe) --------
+    if mode in ("idx", "yahoo_fallback_idx"):
+        if mode == "yahoo_fallback_idx":
+            idx_targets = [t for t in missing_after_yahoo]
+        else:
+            idx_targets = list(tickers_jk)
+
+        if idx_targets:
+            try:
+                from data_idx import fetch_idx_prices  # local import to avoid cycles
+            except Exception:
+                fetch_idx_prices = None  # type: ignore
+
+            df_idx = pd.DataFrame()
+            if fetch_idx_prices is not None:
+                try:
+                    df_idx = fetch_idx_prices(
+                        tickers_jk=idx_targets,
+                        lookback_days_price=int(lookback_days_price),
+                    )
+                except Exception:
+                    df_idx = pd.DataFrame()
+
+            if df_idx is not None and not df_idx.empty:
+                # Ensure at least ticker/date/close columns exist as expected
+                df_idx = df_idx.copy()
+                # (columns already ticker, date, close[, volume] from data_idx)
+                out_frames.append(df_idx)
+
+                present_idx = (
+                    df_idx.get("ticker", pd.Series(dtype=str))
+                    .dropna()
+                    .astype(str)
+                    .unique()
+                    .tolist()
+                )
+                for t in present_idx:
+                    # Only set to IDX if Yahoo didn't already fill it
+                    if t in source_map and source_map[t] == "none":
+                        source_map[t] = "idx"
+
+        # If pure IDX mode, we skip Stooq and finish
+        if mode == "idx":
+            combo = (
+                pd.concat(out_frames, ignore_index=True)
+                if out_frames
+                else pd.DataFrame()
+            )
+            cache.set("prices_combo", key, {"df": combo, "src": source_map})
+            return combo, source_map
+
+    # -------- 3) Stooq fallback (for remaining missing) --------
     if mode in ("stooq", "yahoo_fallback_stooq"):
-        for t in missing_after_yahoo if mode == "yahoo_fallback_stooq" else tickers_jk:
-            # Per-ticker cache
-            t_key = f"stooq|t={t}|days={int(lookback_days_price)}"
-            cached_t = cache.get("prices_stooq", t_key, ttl_seconds=ttl_seconds)
-            if isinstance(cached_t, pd.DataFrame) and not cached_t.empty:
-                df_t = cached_t.copy()
+        if mode == "yahoo_fallback_stooq":
+            stooq_targets = [t for t in missing_after_yahoo]
+        else:
+            stooq_targets = list(tickers_jk)
+
+        start = pd.Timestamp.utcnow() - pd.Timedelta(
+            days=int(lookback_days_price) + 3
+        )
+
+        for t in stooq_targets:
+            custom_symbol = stooq_overrides.get(t)
+            if custom_symbol:
+                candidates = [custom_symbol]
             else:
-                sym_override = stooq_overrides.get(t, "").strip()
-                candidates = [sym_override] if sym_override else _stooq_symbol_candidates(t)
-                df_t = pd.DataFrame()
+                candidates = _stooq_symbol_candidates(t)
 
-                for sym in [c for c in candidates if c]:
-                    df_try = _fetch_stooq_one(sym)
-                    if df_try is None or df_try.empty:
-                        continue
-                    df_t = df_try
+            df_t = pd.DataFrame()
+            for sym in candidates:
+                df_candidate = _fetch_stooq_one(sym)
+                if df_candidate is not None and not df_candidate.empty:
+                    df_t = df_candidate
                     break
-
-                if df_t is not None and not df_t.empty:
-                    cache.set("prices_stooq", t_key, df_t)
 
             if df_t is None or df_t.empty:
                 continue
 
-            # Filter lookback window
-            start = datetime.utcnow() - timedelta(days=int(lookback_days_price) + 3)
-            df_t = df_t[df_t["date"] >= pd.Timestamp(start)]
-
-            # Normalize to match yfinance output schema as much as possible
             df_t = df_t.copy()
-            df_t["ticker"] = t
-            # create Date column to match your existing downstream usage
-            df_t["Date"] = df_t["date"]
-            out_frames.append(df_t)
-            source_map[t] = "stooq"
+            # Filter by lookback
+            df_t["date"] = pd.to_datetime(df_t["date"], errors="coerce")
+            df_t = df_t[df_t["date"] >= start]
+            if df_t.empty:
+                continue
 
-    combo = pd.concat(out_frames, ignore_index=True) if out_frames else pd.DataFrame()
+            df_t["ticker"] = t
+            out_frames.append(df_t)
+
+            if t in source_map and source_map[t] == "none":
+                source_map[t] = "stooq"
+
+    # -------- 4) Combine & cache --------
+    combo = (
+        pd.concat(out_frames, ignore_index=True) if out_frames else pd.DataFrame()
+    )
+
+    # Optional: standardize datetime column name for downstream normalization
     if "Date" in combo.columns:
         combo["Date"] = pd.to_datetime(combo["Date"], errors="coerce")
 
     cache.set("prices_combo", key, {"df": combo, "src": source_map})
     return combo, source_map
+
 
 
 def load_prices_from_csv(

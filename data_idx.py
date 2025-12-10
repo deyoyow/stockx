@@ -1,98 +1,127 @@
 # data_idx.py
 from __future__ import annotations
 
+import json
+from datetime import datetime, timedelta
 from typing import List
+
+import cloudscraper
 import pandas as pd
-import requests
+
+from cache_disk import DiskCache
+
+IDX_URL_TEMPLATE = (
+    "https://idx.co.id/umbraco/Surface/ListedCompany/GetTradingInfoSS?"
+    "code={code}&length={length}"
+)
 
 
-IDX_ENDPOINT = "https://idx.co.id/umbraco/Surface/ListedCompany/GetTradingInfoSS"
-
-
-def _fetch_idx_one(code: str, length: int) -> pd.DataFrame:
+def _fetch_idx_one(
+    ticker_jk: str,
+    length: int,
+    cache: DiskCache,
+    ttl_seconds: int,
+) -> pd.DataFrame:
     """
-    Low-level call to the IDX endpoint for a single code (e.g. 'BBRI').
+    Fetch raw daily data for a single IDX code using the same endpoint
+    as antonizer/IDX-Scrapper.
 
-    Returns a DataFrame with at least: Date, Close, Volume
-    or an empty frame if nothing usable comes back.
+    Returns a DataFrame with columns: date, close, volume.
     """
-    params = {"code": code, "length": int(length)}
+    base = ticker_jk.split(".")[0].upper().strip()
+    if not base:
+        return pd.DataFrame()
+
+    key = f"idx|code={base}|len={int(length)}"
+    cached = cache.get("prices_idx", key, ttl_seconds=ttl_seconds)
+    if isinstance(cached, pd.DataFrame) and not cached.empty:
+        return cached.copy()
+
+    scraper = cloudscraper.CloudScraper()
+    url = IDX_URL_TEMPLATE.format(code=base, length=int(length))
 
     try:
-        r = requests.get(IDX_ENDPOINT, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
+        text = scraper.get(url, timeout=15).text
+        payload = json.loads(text)
     except Exception:
         return pd.DataFrame()
 
-    replies = data.get("replies") or []
+    replies = payload.get("replies") or []
     if not replies:
         return pd.DataFrame()
 
-    df = pd.DataFrame(replies)
+    rows = []
+    for row in replies:
+        # IDX returns a string date, let pandas parse it
+        date_raw = row.get("Date")
+        if not date_raw:
+            continue
 
-    # Normalize column names
-    df.columns = [str(c).strip().lower() for c in df.columns]
+        dt = pd.to_datetime(date_raw, errors="coerce")
+        if pd.isna(dt):
+            continue
 
-    # Expect date/close/volume-ish columns
-    date_col = "date"
-    close_col = "close"
-    vol_col = "volume" if "volume" in df.columns else None
+        rows.append(
+            {
+                "date": dt,
+                "close": row.get("Close"),
+                "volume": row.get("Volume"),
+            }
+        )
 
-    if date_col not in df.columns or close_col not in df.columns:
+    if not rows:
         return pd.DataFrame()
 
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    df = df.dropna(subset=[date_col])
-
-    keep = [date_col, close_col]
-    if vol_col:
-        keep.append(vol_col)
-
-    return df[keep].copy()
+    df = pd.DataFrame(rows)
+    cache.set("prices_idx", key, df)
+    return df
 
 
 def fetch_idx_prices(
     tickers_jk: List[str],
     lookback_days_price: int,
+    cache: DiskCache,
+    ttl_seconds: int,
 ) -> pd.DataFrame:
     """
-    High-level IDX scraper: accepts a list of 'BBRI.JK' style tickers and
-    returns a long-format DataFrame with columns: ticker, date, close[, volume].
+    Fetch prices from IDX for the given tickers and lookback.
 
-    This is meant to feed directly into normalize_price_frame / price_idx.csv.
+    Returns a long dataframe with: ticker, date, close, volume.
     """
     tickers_jk = [t.strip() for t in tickers_jk if t and str(t).strip()]
+    tickers_jk = sorted(set(tickers_jk))
     if not tickers_jk:
         return pd.DataFrame()
 
-    rows = []
+    # Slightly longer than lookback to be safe
+    length = max(1, int(lookback_days_price) + 3)
 
-    for t in sorted(set(tickers_jk)):
-        base = t.split(".")[0].upper()  # 'BBRI.JK' -> 'BBRI'
-        df_one = _fetch_idx_one(base, length=int(lookback_days_price))
-        if df_one is None or df_one.empty:
+    out_frames = []
+    for t in tickers_jk:
+        df_t = _fetch_idx_one(
+            ticker_jk=t,
+            length=length,
+            cache=cache,
+            ttl_seconds=ttl_seconds,
+        )
+        if df_t is None or df_t.empty:
             continue
 
-        df_one = df_one.copy()
-        df_one["ticker"] = t
-        rows.append(df_one)
+        df_t = df_t.copy()
+        df_t["ticker"] = t.upper()
 
-    if not rows:
+        # Filter lookback window (defensive)
+        start = datetime.utcnow() - timedelta(days=int(lookback_days_price) + 3)
+        df_t = df_t[df_t["date"] >= pd.Timestamp(start)]
+        if df_t.empty:
+            continue
+
+        out_frames.append(df_t)
+
+    if not out_frames:
         return pd.DataFrame()
 
-    df = pd.concat(rows, ignore_index=True)
-    df.rename(
-        columns={
-            "date": "date",
-            "close": "close",
-            "volume": "volume",
-        },
-        inplace=True,
-    )
-
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date", "close"])
-
-    df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
-    return df[["ticker", "date", "close"] + (["volume"] if "volume" in df.columns else [])]
+    combo = pd.concat(out_frames, ignore_index=True)
+    combo["date"] = pd.to_datetime(combo["date"], errors="coerce")
+    combo = combo.dropna(subset=["date"])
+    return combo
