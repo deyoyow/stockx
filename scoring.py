@@ -58,6 +58,7 @@ def fetch_gnews_for_universe(
     ttl_seconds: int,
     max_workers: int,
     progress_cb: Optional[Callable[[int, int, str | None], None]] = None,
+    error_log: Optional[list[str]] = None,
 ) -> pd.DataFrame:
     tasks = []
     for t in tickers:
@@ -78,6 +79,7 @@ def fetch_gnews_for_universe(
             cache=cache,
             ttl_seconds=ttl_seconds,
             lang="en",
+            errors=error_log,
         )
         # sentiment on title + description
         if df is None or df.empty:

@@ -56,18 +56,27 @@ def fetch_gnews_articles(
     cache: DiskCache,
     ttl_seconds: int,
     lang: str = "en",
+    errors: Optional[list[str]] = None,
 ) -> pd.DataFrame:
     """
     Returns articles dataframe with:
     publishedAt,title,description,url,source_name,source_url,ticker
     """
     t = ticker.strip().upper()
-    cache_key = f"gnews|t={t}|q={query}|days={int(lookback_days)}|n={int(max_results)}|lang={lang}"
+    n = max(1, int(max_results))
+    if n > 10:
+        n = 10
+        if errors is not None:
+            errors.append("GNews max_results capped at 10 (free tier limit).")
+
+    cache_key = f"gnews|t={t}|q={query}|days={int(lookback_days)}|n={n}|lang={lang}"
     cached = cache.get("gnews_articles", cache_key, ttl_seconds=ttl_seconds)
     if isinstance(cached, pd.DataFrame) and not cached.empty:
         return cached
 
     if not api_key:
+        if errors is not None:
+            errors.append("GNEWS_API_KEY missing; skipping request.")
         return pd.DataFrame()
 
     end_dt = datetime.now(timezone.utc)
@@ -81,20 +90,30 @@ def fetch_gnews_articles(
         "lang": lang,
         "from": from_dt,
         "to": to_dt,
-        "max": int(max_results),
+        "max": int(n),
         "token": api_key,
     }
 
     try:
         r = requests.get(GNEWS_ENDPOINT, params=params, timeout=20)
         if r.status_code != 200:
+            if errors is not None:
+                msg = r.text.strip()
+                msg = msg[:300] if len(msg) > 300 else msg
+                errors.append(
+                    f"GNews returned HTTP {r.status_code} for {t}: {msg or 'no response body'}"
+                )
             return pd.DataFrame()
         data = r.json()
-    except Exception:
+    except Exception as e:
+        if errors is not None:
+            errors.append(f"Request to GNews failed for {t}: {e}")
         return pd.DataFrame()
 
     articles = data.get("articles", []) or []
     if not articles:
+        if errors is not None:
+            errors.append(f"GNews returned zero articles for {t} (query: {query}).")
         return pd.DataFrame()
 
     rows = []
@@ -128,6 +147,7 @@ def fetch_latest_headlines(
     cache: DiskCache,
     ttl_seconds: int,
     lang: str = "en",
+    errors: Optional[list[str]] = None,
 ) -> pd.DataFrame:
     df = fetch_gnews_articles(
         ticker=ticker,
@@ -138,6 +158,7 @@ def fetch_latest_headlines(
         cache=cache,
         ttl_seconds=ttl_seconds,
         lang=lang,
+        errors=errors,
     )
     if df is None or df.empty:
         return pd.DataFrame(columns=["publishedAt", "title", "source_name", "url"])
