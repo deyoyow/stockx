@@ -26,6 +26,8 @@ from scoring import (
     rank_final,
     rank_stage1,
 )
+from data_idx import fetch_idx_prices
+
 
 ROOT_DIR = Path(__file__).resolve().parent
 LOCAL_PRICE_CSV_PATH = ROOT_DIR / "data" / "price_idx.csv"
@@ -219,38 +221,58 @@ def fetch_live_prices_and_cache(
         return pd.DataFrame(), {}, "No tickers supplied."
 
     try:
-        df_raw, src_raw = fetch_prices_fast(
+        # data_yahoo.fetch_prices_fast returns a single DataFrame
+        df_raw = fetch_prices_fast(
             tickers_jk=tickers_jk,
             lookback_days_price=int(lookback_days_price),
             cache=cache,
             ttl_seconds=config.CACHE_TTL_SECONDS,
         )
     except Exception as e:  # pragma: no cover - defensive UI guard
-        return pd.DataFrame(), _build_src_map(tickers_jk, set(), "yahoo"), f"Price fetch failed: {e}"
+        return (
+            pd.DataFrame(),
+            _build_src_map(tickers_jk, set(), "yahoo"),
+            f"Price fetch failed: {e}",
+        )
 
     df_norm = normalize_price_frame(df_raw)
     if df_norm is None or df_norm.empty:
-        return pd.DataFrame(), _build_src_map(tickers_jk, set(), "yahoo"), "No usable price data returned from yfinance."
+        return (
+            pd.DataFrame(),
+            _build_src_map(tickers_jk, set(), "yahoo"),
+            "No usable price data returned from yfinance.",
+        )
 
+    # Keep only requested tickers and apply lookback filter
     df_norm = df_norm[df_norm["ticker"].isin(tickers_jk)]
     df_norm = _filter_prices_by_lookback(df_norm, lookback_days_price)
 
-    src_map = {t: src_raw.get(t, "none") for t in tickers_jk}
-    present = set(df_norm.get("ticker", pd.Series(dtype=str)).dropna().astype(str).unique())
-    for t in present:
-        if t in src_map:
-            src_map[t] = "yahoo"
+    # Build src_map based purely on which tickers actually appear
+    present = set(
+        df_norm.get("ticker", pd.Series(dtype=str))
+        .dropna()
+        .astype(str)
+        .unique()
+    )
+    src_map = _build_src_map(tickers_jk, present, "yahoo")
 
     if df_norm.empty:
-        return pd.DataFrame(), src_map, "No usable price rows after filtering by lookback."
+        return (
+            pd.DataFrame(),
+            src_map,
+            "No usable price rows after filtering by lookback.",
+        )
 
     try:
         LOCAL_PRICE_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
         df_norm.to_csv(LOCAL_PRICE_CSV_PATH, index=False)
     except Exception as e:  # pragma: no cover - filesystem guard
-        return df_norm, src_map, f"Saved live data in memory but failed to write CSV: {e}"
+        return df_norm, src_map, (
+            f"Saved live data in memory but failed to write CSV: {e}"
+        )
 
     return df_norm, src_map, None
+
 
 
 tab_screener, tab_scraper, tab_portfolio = st.tabs([
@@ -665,11 +687,14 @@ with tab_screener:
 # Prices & Scraper tab
 # ----------------------------
 with tab_scraper:
-    st.subheader("Scrape prices and overwrite CSV")
-    st.write("Enter IDX tickers (no .JK). Prices are saved to data/price_idx.csv in long format.")
+    st.subheader("Scrape prices (IDX) and overwrite CSV")
+    st.write(
+        "Enter IDX tickers (no .JK). This uses the official IDX JSON endpoint, "
+        "converts it to long format, and saves to data/price_idx.csv."
+    )
 
     scrape_tickers_text = st.text_area(
-        "Tickers to scrape (one per line)",
+        "Tickers to scrape (one per line, IDX codes like BBRI, TLKM, etc.)",
         value="\n".join(config.WATCHLIST[:10]),
         height=160,
     )
@@ -681,28 +706,52 @@ with tab_scraper:
         step=5,
     )
 
-    if st.button("Run scrape & overwrite prices CSV", type="primary"):
+    if st.button("Run IDX scrape & overwrite prices CSV", type="primary"):
         scrape_tickers = _parse_ticker_text(scrape_tickers_text)
         if not scrape_tickers:
             st.warning("Please enter at least one ticker.")
         else:
             tickers_jk = [f"{t}.JK" for t in scrape_tickers]
-            df_scraped, src_map_scraped, err_msg = fetch_live_prices_and_cache(
-                tickers_jk=tickers_jk,
-                lookback_days_price=int(scrape_lookback),
-                cache=cache,
-            )
 
-            if err_msg:
-                st.warning(err_msg)
+            with st.spinner("Scraping prices from IDX..."):
+                try:
+                    df_raw = fetch_idx_prices(
+                        tickers_jk=tickers_jk,
+                        lookback_days_price=int(scrape_lookback),
+                    )
+                except Exception as e:  # pragma: no cover - defensive UI guard
+                    st.error(f"IDX scraping failed: {e}")
+                    df_raw = pd.DataFrame()
 
-            if df_scraped is None or df_scraped.empty:
-                st.error("No prices returned (rate limited or network issue).")
+            df_norm = normalize_price_frame(df_raw)
+
+            if df_norm is None or df_norm.empty:
+                st.error("No price data returned from IDX for the requested tickers.")
             else:
-                missing = [t for t, src in src_map_scraped.items() if src == "none"]
-                if missing:
-                    st.warning(f"No data returned for: {', '.join(missing)}")
-                st.success(f"Saved {len(df_scraped)} rows to {LOCAL_PRICE_CSV_PATH}.")
+                # Determine which tickers got data
+                present = (
+                    df_norm.get("ticker", pd.Series(dtype=str))
+                    .dropna()
+                    .astype(str)
+                    .unique()
+                    .tolist()
+                )
+                missing = [t for t in tickers_jk if t not in present]
+
+                try:
+                    LOCAL_PRICE_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    df_norm.to_csv(LOCAL_PRICE_CSV_PATH, index=False)
+                    st.success(
+                        f"Saved {len(df_norm)} rows for "
+                        f"{len(set(present))} tickers to {LOCAL_PRICE_CSV_PATH}."
+                    )
+                    if missing:
+                        st.warning(
+                            "No IDX data returned for: "
+                            + ", ".join(sorted(missing))
+                        )
+                except Exception as e:
+                    st.error(f"Failed to write price_idx.csv: {e}")
 
     prices_path = LOCAL_PRICE_CSV_PATH
     if prices_path.exists():
@@ -713,7 +762,8 @@ with tab_scraper:
         except Exception as e:  # pragma: no cover - UI safety
             st.error(f"Failed to read existing CSV: {e}")
     else:
-        st.info("price_idx.csv not found yet. Run the scraper to generate it.")
+        st.info("price_idx.csv not found yet. Run the IDX scraper to generate it.")
+
 
 
 # ----------------------------
