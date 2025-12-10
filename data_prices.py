@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import pandas as pd
@@ -213,3 +214,56 @@ def fetch_prices(
 
     cache.set("prices_combo", key, {"df": combo, "src": source_map})
     return combo, source_map
+
+
+def load_prices_from_csv(
+    path: Path, tickers_jk: list[str], lookback_days_price: int
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """
+    Load long-format price data from CSV with columns: ticker,date,close[,volume]
+    Returns (df, src_map) where src_map maps ticker_jk -> "csv" or "none".
+    """
+
+    tickers_jk = [t.strip() for t in tickers_jk if t and str(t).strip()]
+    tickers_jk = sorted(set(tickers_jk))
+    if not tickers_jk:
+        return pd.DataFrame(), {}
+
+    src_map: dict[str, str] = {t: "none" for t in tickers_jk}
+    if path is None or not Path(path).exists():
+        return pd.DataFrame(), src_map
+
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame(), src_map
+
+    if df is None or df.empty:
+        return pd.DataFrame(), src_map
+
+    df = df.copy()
+    df.columns = [c.strip().lower() for c in df.columns]
+    if "ticker" not in df.columns or "date" not in df.columns or "close" not in df.columns:
+        return pd.DataFrame(), src_map
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date", "close", "ticker"])
+
+    # Filter to requested tickers and lookback window
+    df = df[df["ticker"].isin(tickers_jk)]
+    if df.empty:
+        return pd.DataFrame(), src_map
+
+    start = datetime.utcnow() - timedelta(days=int(lookback_days_price) + 3)
+    df = df[df["date"] >= pd.Timestamp(start)]
+    if df.empty:
+        return pd.DataFrame(), src_map
+
+    df = df[[c for c in ["ticker", "date", "close", "volume"] if c in df.columns]].copy()
+    df.sort_values(["ticker", "date"], inplace=True)
+
+    for t in df["ticker"].dropna().astype(str).unique():
+        if t in src_map:
+            src_map[t] = "csv"
+
+    return df, src_map

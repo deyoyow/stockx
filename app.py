@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import os
 
@@ -22,8 +23,8 @@ from scoring import (
     compute_price_features,
     fetch_gnews_for_universe,
     fetch_x_for_tickers,
-    rank_stage1,
     rank_final,
+    rank_stage1,
 )
 
 # -------------------------------------------------------------------
