@@ -13,6 +13,11 @@ import os
 from dotenv import load_dotenv
 
 from data_gnews import fetch_latest_headlines
+from data_gdelt import (
+    build_keyword_query as build_gdelt_query,
+    fetch_gdelt_metrics,
+    fetch_latest_headlines as fetch_gdelt_headlines,
+)
 from scoring import (
     compute_price_features,
     fetch_gnews_for_universe,
@@ -224,6 +229,60 @@ if run:
             error_log=gnews_errors,
         )
 
+        # Fallback to GDELT for tickers where GNews returned nothing (HTTP 429, empty, etc.)
+        missing_tickers = [
+            str(row["ticker"])
+            for _, row in gnews_df.fillna({"gnews_buzz": 0}).iterrows()
+            if (row.get("gnews_buzz", 0) == 0 and pd.isna(row.get("gnews_sent")))
+        ]
+
+        if missing_tickers:
+            gnews_errors.append(
+                f"Falling back to GDELT for {len(missing_tickers)} tickers with no GNews coverage."
+            )
+
+            def gdelt_progress(done: int, total: int, ticker: str | None = None) -> None:
+                total = max(1, int(total))
+                done = int(done)
+                pct = 30 + int(15 * (done / total))  # 30..45
+                name = f" ({ticker})" if ticker else ""
+                set_progress(pct, f"GDELT fallback {done}/{total}{name}...")
+
+            gdelt_rows = []
+            total_missing = max(1, len(missing_tickers))
+            for i, t in enumerate(missing_tickers, start=1):
+                gdelt_progress(i, total_missing, t)
+                q = build_gdelt_query(t, config.ALIASES)
+                metrics = fetch_gdelt_metrics(
+                    query=q,
+                    lookback_days_news=int(lookback_news),
+                    include_vol=True,
+                    cache=cache,
+                    ttl_seconds=config.CACHE_TTL_SECONDS,
+                )
+                gdelt_rows.append(
+                    {
+                        "ticker": t,
+                        "kw_used": q,
+                        "gnews_sent": metrics.get("tone_latest", np.nan),
+                        "gnews_buzz": metrics.get("vol_latest", 0),
+                    }
+                )
+
+            if gdelt_rows:
+                gdf = gnews_df.set_index("ticker")
+                for r in gdelt_rows:
+                    t = r["ticker"]
+                    if t not in gdf.index:
+                        gdf.loc[t] = {"kw_used": "", "gnews_sent": np.nan, "gnews_buzz": 0}
+                    if pd.isna(gdf.loc[t].get("gnews_sent")) and gdf.loc[t].get("gnews_buzz", 0) == 0:
+                        gdf.loc[t, ["kw_used", "gnews_sent", "gnews_buzz"]] = [
+                            r["kw_used"],
+                            r["gnews_sent"],
+                            r["gnews_buzz"],
+                        ]
+                gnews_df = gdf.reset_index()
+
     merged = f.merge(gnews_df, on="ticker", how="left")
 
     # If user checked "Tone only", interpret it as: GNews only (skip X stage)
@@ -359,6 +418,17 @@ if run:
                 errors=gnews_errors,
             )
 
+            if (headlines is None or headlines.empty) and advanced_mode:
+                gnews_errors.append(f"No GNews headlines for {t}; trying GDELT fallback.")
+                gdelt_query = build_gdelt_query(t, config.ALIASES)
+                headlines = fetch_gdelt_headlines(
+                    query=gdelt_query,
+                    lookback_days_news=int(lookback_news),
+                    max_records=10,
+                    cache=cache,
+                    ttl_seconds=config.CACHE_TTL_SECONDS,
+                )
+
             with st.expander(f"{t}", expanded=False):
                 if advanced_mode:
                     st.caption("Query used:")
@@ -371,8 +441,8 @@ if run:
                 for _, h in headlines.iterrows():
                     title = str(h.get("title", "")).strip()
                     url = str(h.get("url", "")).strip()
-                    src = str(h.get("source_name", "")).strip()
-                    dt = str(h.get("publishedAt", "")).strip()
+                    src = str(h.get("source_name", h.get("domain", ""))).strip()
+                    dt = str(h.get("publishedAt", h.get("seendate", ""))).strip()
 
                     if title and url:
                         st.markdown(f"- [{title}]({url})  \n  {src} | {dt}")
