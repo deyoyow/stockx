@@ -234,20 +234,13 @@ def load_prices_from_csv(
         return pd.DataFrame(), src_map
 
     try:
-        df = pd.read_csv(path)
+        df_raw = pd.read_csv(path)
     except Exception:
         return pd.DataFrame(), src_map
 
+    df = normalize_price_frame(df_raw)
     if df is None or df.empty:
         return pd.DataFrame(), src_map
-
-    df = df.copy()
-    df.columns = [c.strip().lower() for c in df.columns]
-    if "ticker" not in df.columns or "date" not in df.columns or "close" not in df.columns:
-        return pd.DataFrame(), src_map
-
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date", "close", "ticker"])
 
     # Filter to requested tickers and lookback window
     df = df[df["ticker"].isin(tickers_jk)]
@@ -258,8 +251,6 @@ def load_prices_from_csv(
     df = df[df["date"] >= pd.Timestamp(start)]
     if df.empty:
         return pd.DataFrame(), src_map
-
-    df = df[[c for c in ["ticker", "date", "close", "volume"] if c in df.columns]].copy()
     df.sort_values(["ticker", "date"], inplace=True)
 
     for t in df["ticker"].dropna().astype(str).unique():
@@ -267,3 +258,42 @@ def load_prices_from_csv(
             src_map[t] = "csv"
 
     return df, src_map
+
+
+def normalize_price_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize any dataframe containing price data into the expected long format:
+    ticker, date, close[, volume]. Returns an empty frame when unusable.
+    """
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    out.columns = [c.strip().lower() for c in out.columns]
+
+    if "close" not in out.columns and "adj close" in out.columns:
+        out["close"] = out["adj close"]
+
+    if "date" not in out.columns and "datetime" in out.columns:
+        out["date"] = pd.to_datetime(out["datetime"], errors="coerce")
+    if "date" not in out.columns and "Date" in df.columns:
+        out["date"] = pd.to_datetime(df["Date"], errors="coerce")
+    if "date" not in out.columns:
+        return pd.DataFrame()
+
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+
+    required_cols = {"ticker", "close", "date"}
+    if not required_cols.issubset(set(out.columns)):
+        return pd.DataFrame()
+
+    keep_cols = [c for c in ["ticker", "date", "close", "volume"] if c in out.columns]
+    out = out[keep_cols]
+    out = out.dropna(subset=["ticker", "date", "close"])
+    if out.empty:
+        return pd.DataFrame()
+
+    out["ticker"] = out["ticker"].astype(str).str.strip()
+    out = out.sort_values(["ticker", "date"]).reset_index(drop=True)
+    return out
