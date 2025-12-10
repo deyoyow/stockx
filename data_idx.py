@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Tuple
 
 import pandas as pd
 import requests
@@ -73,3 +73,28 @@ def fetch_idx_prices_for_one(ticker_jk: str, lookback_days: int) -> pd.DataFrame
     df["volume"] = pd.to_numeric(df.get("volume"), errors="coerce")
     df = df.dropna(subset=["close", "date"])
     return df.sort_values("date").reset_index(drop=True)
+
+
+def fetch_idx_prices(tickers_jk: list[str], lookback_days: int) -> Tuple[pd.DataFrame, dict[str, str]]:
+    """Batch helper that iterates ``fetch_idx_prices_for_one``.
+
+    Returns a concatenated dataframe plus a simple source map for parity with
+    other fetchers. Any ticker that fails simply stays mapped to "none".
+    """
+
+    tickers_jk = sorted({t for t in tickers_jk if t})
+    if not tickers_jk:
+        return pd.DataFrame(), {}
+
+    frames: list[pd.DataFrame] = []
+    src_map: dict[str, str] = {t: "none" for t in tickers_jk}
+
+    for t in tickers_jk:
+        df_t = fetch_idx_prices_for_one(t, lookback_days)
+        if df_t is None or df_t.empty:
+            continue
+        frames.append(df_t)
+        src_map[t] = "idx"
+
+    combo = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    return combo, src_map

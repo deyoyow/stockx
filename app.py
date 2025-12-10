@@ -36,6 +36,10 @@ ROOT_DIR = Path(__file__).resolve().parent
 LOCAL_PRICE_CSV_PATH = ROOT_DIR / "data" / "price_idx.csv"
 PORTFOLIO_CSV_PATH = ROOT_DIR / "data" / "portfolio.csv"
 
+ROOT_DIR = Path(__file__).resolve().parent
+LOCAL_PRICE_CSV_PATH = ROOT_DIR / "data" / "price_idx.csv"
+PORTFOLIO_CSV_PATH = ROOT_DIR / "data" / "portfolio.csv"
+
 load_dotenv()
 GNEWS_API_KEY = os.getenv("GNEWS_API_KEY", "").strip()
 X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
@@ -47,6 +51,7 @@ cache = DiskCache(ROOT_DIR / ".cache")
 
 st.title("IDX Sentiment Screener")
 st.caption("News-driven ranking with optional CSV prices and disk caching.")
+
 
 
 
