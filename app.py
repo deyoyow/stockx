@@ -216,6 +216,8 @@ if run:
 
     gnews_errors: list[str] = []
 
+    gnews_errors: list[str] = []
+
     def gnews_progress(done: int, total: int, ticker: str | None = None) -> None:
         total = max(1, int(total))
         done = int(done)
