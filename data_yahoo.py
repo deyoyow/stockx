@@ -1,6 +1,6 @@
 # data_yahoo.py
 from __future__ import annotations
-from typing import List
+from typing import Dict, List, Tuple
 import pandas as pd
 import yfinance as yf
 from cache_disk import DiskCache
@@ -60,15 +60,20 @@ def fetch_prices_fast(
     lookback_days_price: int,
     cache: DiskCache,
     ttl_seconds: int,
-) -> pd.DataFrame:
-    tickers_jk = [t.strip() for t in tickers_jk if t and str(t).strip()]
-    if not tickers_jk:
-        return pd.DataFrame()
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """yfinance-only price fetch with cache and explicit source map."""
 
-    key = f"fast|days={int(lookback_days_price)}|tickers={' '.join(sorted(tickers_jk))}"
+    tickers_jk = sorted(set([t.strip() for t in tickers_jk if t and str(t).strip()]))
+    if not tickers_jk:
+        return pd.DataFrame(), {}
+
+    key = f"fast|days={int(lookback_days_price)}|tickers={' '.join(tickers_jk)}"
     cached = cache.get("prices", key, ttl_seconds=ttl_seconds)
-    if isinstance(cached, pd.DataFrame) and not cached.empty:
-        return cached
+    if isinstance(cached, dict) and "df" in cached and "src" in cached:
+        df_cached = cached["df"]
+        src_cached = cached["src"]
+        if isinstance(df_cached, pd.DataFrame) and isinstance(src_cached, dict):
+            return df_cached, src_cached
 
     tickers_str = " ".join(tickers_jk)
     df = yf.download(
@@ -82,6 +87,11 @@ def fetch_prices_fast(
     )
 
     out = _normalize_yf_download(df, tickers_jk)
-    if out is not None and not out.empty:
-        cache.set("prices", key, out)
-    return out
+    if out is None or out.empty:
+        return pd.DataFrame(), {t: "none" for t in tickers_jk}
+
+    got = set(out["ticker"].dropna().astype(str).unique().tolist())
+    src_map = {t: ("yahoo" if t in got else "none") for t in tickers_jk}
+
+    cache.set("prices", key, {"df": out, "src": src_map})
+    return out, src_map
