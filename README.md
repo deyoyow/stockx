@@ -7,7 +7,6 @@ streamlit run app.py
 ### Usage tips
 
 - If you see many GNews HTTP 429 errors, reduce the "Max tickers for GNews" cap in Advanced mode so fewer requests are sent; the remaining tickers will automatically fall back to GDELT headlines.
-- If the new direct price scraper looks unstable, switch the "Price backend" selector to **YFinance (API)** to reuse the legacy yfinance-based feed.
 
 ### Secrets
 
