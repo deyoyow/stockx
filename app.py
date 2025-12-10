@@ -89,6 +89,15 @@ with st.sidebar:
             step=5,
         )
 
+        gnews_cap = st.number_input(
+            "Max tickers for GNews (rate limit)",
+            min_value=5,
+            max_value=100,
+            value=config.GNEWS_MAX_TICKERS_DEFAULT,
+            step=1,
+            help="Only the most liquid tickers will hit GNews to avoid 429 throttling; others fall back to GDELT.",
+        )
+
         st.subheader("Lookback")
         lookback_news = st.number_input(
             "News lookback (days)",
@@ -114,6 +123,7 @@ with st.sidebar:
         w_mom = st.slider("Momentum weight", 0.0, 1.0, config.WEIGHT_MOMENTUM_DEFAULT, 0.05)
     else:
         prefilter_n = config.PREFILTER_N_DEFAULT
+        gnews_cap = config.GNEWS_MAX_TICKERS_DEFAULT
         lookback_news = config.LOOKBACK_DAYS_NEWS_DEFAULT
         lookback_price = config.LOOKBACK_DAYS_PRICE_DEFAULT
         gdelt_workers = config.GDELT_WORKERS_DEFAULT
@@ -199,8 +209,12 @@ if run:
         .reset_index(drop=True)
     )
 
-    # 4) Stage-1: GNews sentiment for all prefiltered tickers
-    total_news = len(f)
+    # 4) Stage-1: GNews sentiment for most-liquid prefiltered tickers (cap to avoid 429s)
+    gnews_targets = f.head(int(gnews_cap)).copy()
+    skipped_for_gnews = f.iloc[len(gnews_targets) :]["ticker"].tolist()
+    total_news = len(gnews_targets)
+
+    gnews_errors: list[str] = []
 
     gnews_errors: list[str] = []
 
@@ -215,9 +229,14 @@ if run:
         st.warning("GNEWS_API_KEY not set. GNews stage will return empty -> ranking will be weak.")
         gnews_df = pd.DataFrame(columns=["ticker", "kw_used", "gnews_sent", "gnews_buzz"])
     else:
+        if skipped_for_gnews:
+            gnews_errors.append(
+                f"Skipping GNews for {len(skipped_for_gnews)} tickers beyond cap {gnews_cap}; they will use GDELT fallback if needed."
+            )
+
         set_progress(30, f"Fetching GNews for {total_news} tickers...")
         gnews_df = fetch_gnews_for_universe(
-            tickers=f["ticker"].tolist(),
+            tickers=gnews_targets["ticker"].tolist(),
             aliases=config.ALIASES,
             gnews_api_key=GNEWS_API_KEY,
             lookback_days_news=int(lookback_news),
@@ -228,6 +247,17 @@ if run:
             progress_cb=gnews_progress,
             error_log=gnews_errors,
         )
+
+        if skipped_for_gnews:
+            pad = pd.DataFrame(
+                {
+                    "ticker": skipped_for_gnews,
+                    "kw_used": [""] * len(skipped_for_gnews),
+                    "gnews_sent": [np.nan] * len(skipped_for_gnews),
+                    "gnews_buzz": [0] * len(skipped_for_gnews),
+                }
+            )
+            gnews_df = pd.concat([gnews_df, pad], ignore_index=True)
 
         # Fallback to GDELT for tickers where GNews returned nothing (HTTP 429, empty, etc.)
         missing_tickers = [
