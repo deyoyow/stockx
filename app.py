@@ -1,4 +1,3 @@
-# app.py
 from __future__ import annotations
 
 import os
@@ -45,9 +44,42 @@ st.title("IDX Sentiment Screener")
 st.caption("News-driven ranking with optional CSV prices and disk caching.")
 
 
-# ----------------------------
-# Sidebar controls
-# ----------------------------
+def load_latest_prices(path: Path) -> pd.DataFrame:
+    """
+    Helper for the Portfolio tab.
+    Returns one row per ticker with latest close: columns ticker,date,close.
+    """
+    if not path.exists():
+        return pd.DataFrame(columns=["ticker", "date", "close"])
+
+    try:
+        df_raw = pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame(columns=["ticker", "date", "close"])
+
+    if df_raw is None or df_raw.empty:
+        return pd.DataFrame(columns=["ticker", "date", "close"])
+
+    df = df_raw.copy()
+    df.columns = [c.lower() for c in df.columns]
+
+    required = {"ticker", "date", "close"}
+    if not required.issubset(set(df.columns)):
+        return pd.DataFrame(columns=["ticker", "date", "close"])
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    if df.empty:
+        return pd.DataFrame(columns=["ticker", "date", "close"])
+
+    df = df.sort_values(["ticker", "date"])
+    latest = df.groupby("ticker").tail(1).reset_index(drop=True)
+    return latest[["ticker", "date", "close"]]
+
+
+# -------------------------------------------------------------------
+# Sidebar controls (shared across tabs)
+# -------------------------------------------------------------------
 with st.sidebar:
     st.header("Controls")
     advanced_mode = st.checkbox("Advanced mode", value=False)
@@ -74,7 +106,13 @@ with st.sidebar:
     )
 
     st.subheader("Ranking")
-    top_n = st.number_input("Top N", min_value=3, max_value=30, value=config.TOP_N_DEFAULT, step=1)
+    top_n = st.number_input(
+        "Top N",
+        min_value=3,
+        max_value=30,
+        value=config.TOP_N_DEFAULT,
+        step=1,
+    )
     min_vol = st.number_input(
         "Min avg daily volume (shares)",
         min_value=0,
@@ -84,6 +122,7 @@ with st.sidebar:
 
     tone_only = st.checkbox("Tone only (skip X stage)", value=False)
     show_headlines = st.checkbox("Show headlines (slower)", value=True)
+    show_x_posts = st.checkbox("Show X posts (slower)", value=False)
 
     if advanced_mode:
         st.subheader("Filters")
@@ -121,12 +160,20 @@ with st.sidebar:
         )
 
         st.subheader("Speed")
-        gdelt_workers = st.slider("GDELT workers", 2, 20, config.GDELT_WORKERS_DEFAULT, 1)
+        gdelt_workers = st.slider(
+            "GDELT workers", 2, 20, config.GDELT_WORKERS_DEFAULT, 1
+        )
 
         st.subheader("Weights")
-        w_tone = st.slider("Tone weight", 0.0, 1.0, config.WEIGHT_TONE_DEFAULT, 0.05)
-        w_vol = st.slider("News volume weight", 0.0, 1.0, config.WEIGHT_NEWS_VOL_DEFAULT, 0.05)
-        w_mom = st.slider("Momentum weight", 0.0, 1.0, config.WEIGHT_MOMENTUM_DEFAULT, 0.05)
+        w_tone = st.slider(
+            "Tone weight", 0.0, 1.0, config.WEIGHT_TONE_DEFAULT, 0.05
+        )
+        w_vol = st.slider(
+            "News volume weight", 0.0, 1.0, config.WEIGHT_NEWS_VOL_DEFAULT, 0.05
+        )
+        w_mom = st.slider(
+            "Momentum weight", 0.0, 1.0, config.WEIGHT_MOMENTUM_DEFAULT, 0.05
+        )
     else:
         prefilter_n = config.PREFILTER_N_DEFAULT
         gnews_cap = config.GNEWS_MAX_TICKERS_DEFAULT
