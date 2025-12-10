@@ -9,10 +9,16 @@ import streamlit as st
 import config
 from cache_disk import DiskCache
 from data_prices import fetch_prices
+from data_yahoo import fetch_prices_fast
 import os
 from dotenv import load_dotenv
 
 from data_gnews import fetch_latest_headlines
+from data_gdelt import (
+    build_keyword_query as build_gdelt_query,
+    fetch_gdelt_metrics,
+    fetch_latest_headlines as fetch_gdelt_headlines,
+)
 from scoring import (
     compute_price_features,
     fetch_gnews_for_universe,
@@ -51,11 +57,23 @@ with st.sidebar:
         st.success("Cleared Streamlit cache.")
 
     st.subheader("Data sources")
+    price_backend_ui = st.selectbox(
+        "Price backend",
+        [
+            "Scraped multi-source (direct)",
+            "YFinance (API)",
+        ],
+        index=0,
+        help="Choose between the new direct scraping backend or the legacy yfinance API.",
+    )
+
     price_mode_ui = st.selectbox(
-        "Price source",
+        "Price source (for scraped backend)",
         ["Yahoo (fast)", "Yahoo with Stooq fallback", "Stooq only"],
         index=1,
+        disabled=price_backend_ui != "Scraped multi-source (direct)",
     )
+
     mode_map = {
         "Yahoo (fast)": "yahoo",
         "Yahoo with Stooq fallback": "yahoo_fallback_stooq",
@@ -84,6 +102,15 @@ with st.sidebar:
             step=5,
         )
 
+        gnews_cap = st.number_input(
+            "Max tickers for GNews (rate limit)",
+            min_value=5,
+            max_value=100,
+            value=config.GNEWS_MAX_TICKERS_DEFAULT,
+            step=1,
+            help="Only the most liquid tickers will hit GNews to avoid 429 throttling; others fall back to GDELT.",
+        )
+
         st.subheader("Lookback")
         lookback_news = st.number_input(
             "News lookback (days)",
@@ -109,6 +136,7 @@ with st.sidebar:
         w_mom = st.slider("Momentum weight", 0.0, 1.0, config.WEIGHT_MOMENTUM_DEFAULT, 0.05)
     else:
         prefilter_n = config.PREFILTER_N_DEFAULT
+        gnews_cap = config.GNEWS_MAX_TICKERS_DEFAULT
         lookback_news = config.LOOKBACK_DAYS_NEWS_DEFAULT
         lookback_price = config.LOOKBACK_DAYS_PRICE_DEFAULT
         gdelt_workers = config.GDELT_WORKERS_DEFAULT
@@ -145,15 +173,23 @@ if run:
 
     # 1) Prices
     set_progress(5, "Fetching prices...")
-    price_df, src_map = fetch_prices(
-        tickers_jk=tickers_jk,
-        lookback_days_price=int(lookback_price),
-        cache=cache,
-        ttl_seconds=config.CACHE_TTL_SECONDS,
-        mode=mode_map[price_mode_ui],
-        yf_threads=True,          # speed again
-        stooq_overrides={},       # you can add per-ticker overrides later
-    )
+    if price_backend_ui == "YFinance (API)":
+        price_df, src_map = fetch_prices_fast(
+            tickers_jk=tickers_jk,
+            lookback_days_price=int(lookback_price),
+            cache=cache,
+            ttl_seconds=config.CACHE_TTL_SECONDS,
+        )
+    else:
+        price_df, src_map = fetch_prices(
+            tickers_jk=tickers_jk,
+            lookback_days_price=int(lookback_price),
+            cache=cache,
+            ttl_seconds=config.CACHE_TTL_SECONDS,
+            mode=mode_map[price_mode_ui],
+            yf_threads=True,          # speed again
+            stooq_overrides={},       # you can add per-ticker overrides later
+        )
 
     src_counts = pd.Series(list(src_map.values())).value_counts()
     y_ct = int(src_counts.get("yahoo", 0))
@@ -194,8 +230,12 @@ if run:
         .reset_index(drop=True)
     )
 
-    # 4) Stage-1: GNews sentiment for all prefiltered tickers
-    total_news = len(f)
+    # 4) Stage-1: GNews sentiment for most-liquid prefiltered tickers (cap to avoid 429s)
+    gnews_targets = f.head(int(gnews_cap)).copy()
+    skipped_for_gnews = f.iloc[len(gnews_targets) :]["ticker"].tolist()
+    total_news = len(gnews_targets)
+
+    gnews_errors: list[str] = []
 
     def gnews_progress(done: int, total: int, ticker: str | None = None) -> None:
         total = max(1, int(total))
@@ -208,18 +248,89 @@ if run:
         st.warning("GNEWS_API_KEY not set. GNews stage will return empty -> ranking will be weak.")
         gnews_df = pd.DataFrame(columns=["ticker", "kw_used", "gnews_sent", "gnews_buzz"])
     else:
+        if skipped_for_gnews:
+            gnews_errors.append(
+                f"Skipping GNews for {len(skipped_for_gnews)} tickers beyond cap {gnews_cap}; they will use GDELT fallback if needed."
+            )
+
         set_progress(30, f"Fetching GNews for {total_news} tickers...")
         gnews_df = fetch_gnews_for_universe(
-            tickers=f["ticker"].tolist(),
+            tickers=gnews_targets["ticker"].tolist(),
             aliases=config.ALIASES,
             gnews_api_key=GNEWS_API_KEY,
             lookback_days_news=int(lookback_news),
-            max_articles_per_ticker=20,
+            max_articles_per_ticker=10,
             cache=cache,
             ttl_seconds=config.CACHE_TTL_SECONDS,
             max_workers=int(gdelt_workers),
             progress_cb=gnews_progress,
+            error_log=gnews_errors,
         )
+
+        if skipped_for_gnews:
+            pad = pd.DataFrame(
+                {
+                    "ticker": skipped_for_gnews,
+                    "kw_used": [""] * len(skipped_for_gnews),
+                    "gnews_sent": [np.nan] * len(skipped_for_gnews),
+                    "gnews_buzz": [0] * len(skipped_for_gnews),
+                }
+            )
+            gnews_df = pd.concat([gnews_df, pad], ignore_index=True)
+
+        # Fallback to GDELT for tickers where GNews returned nothing (HTTP 429, empty, etc.)
+        missing_tickers = [
+            str(row["ticker"])
+            for _, row in gnews_df.fillna({"gnews_buzz": 0}).iterrows()
+            if (row.get("gnews_buzz", 0) == 0 and pd.isna(row.get("gnews_sent")))
+        ]
+
+        if missing_tickers:
+            gnews_errors.append(
+                f"Falling back to GDELT for {len(missing_tickers)} tickers with no GNews coverage."
+            )
+
+            def gdelt_progress(done: int, total: int, ticker: str | None = None) -> None:
+                total = max(1, int(total))
+                done = int(done)
+                pct = 30 + int(15 * (done / total))  # 30..45
+                name = f" ({ticker})" if ticker else ""
+                set_progress(pct, f"GDELT fallback {done}/{total}{name}...")
+
+            gdelt_rows = []
+            total_missing = max(1, len(missing_tickers))
+            for i, t in enumerate(missing_tickers, start=1):
+                gdelt_progress(i, total_missing, t)
+                q = build_gdelt_query(t, config.ALIASES)
+                metrics = fetch_gdelt_metrics(
+                    query=q,
+                    lookback_days_news=int(lookback_news),
+                    include_vol=True,
+                    cache=cache,
+                    ttl_seconds=config.CACHE_TTL_SECONDS,
+                )
+                gdelt_rows.append(
+                    {
+                        "ticker": t,
+                        "kw_used": q,
+                        "gnews_sent": metrics.get("tone_latest", np.nan),
+                        "gnews_buzz": metrics.get("vol_latest", 0),
+                    }
+                )
+
+            if gdelt_rows:
+                gdf = gnews_df.set_index("ticker")
+                for r in gdelt_rows:
+                    t = r["ticker"]
+                    if t not in gdf.index:
+                        gdf.loc[t] = {"kw_used": "", "gnews_sent": np.nan, "gnews_buzz": 0}
+                    if pd.isna(gdf.loc[t].get("gnews_sent")) and gdf.loc[t].get("gnews_buzz", 0) == 0:
+                        gdf.loc[t, ["kw_used", "gnews_sent", "gnews_buzz"]] = [
+                            r["kw_used"],
+                            r["gnews_sent"],
+                            r["gnews_buzz"],
+                        ]
+                gnews_df = gdf.reset_index()
 
     merged = f.merge(gnews_df, on="ticker", how="left")
 
@@ -296,6 +407,8 @@ if run:
     set_progress(92, "Rendering results...")
 
     st.subheader(f"Top {top_n} candidates")
+    if gnews_errors:
+        st.warning("\n".join(gnews_errors))
     if advanced_mode:
         show_cols = [
             "ticker",
@@ -351,7 +464,19 @@ if run:
                 cache=cache,
                 ttl_seconds=config.CACHE_TTL_SECONDS,
                 lang="en",
+                errors=gnews_errors,
             )
+
+            if (headlines is None or headlines.empty) and advanced_mode:
+                gnews_errors.append(f"No GNews headlines for {t}; trying GDELT fallback.")
+                gdelt_query = build_gdelt_query(t, config.ALIASES)
+                headlines = fetch_gdelt_headlines(
+                    query=gdelt_query,
+                    lookback_days_news=int(lookback_news),
+                    max_records=10,
+                    cache=cache,
+                    ttl_seconds=config.CACHE_TTL_SECONDS,
+                )
 
             with st.expander(f"{t}", expanded=False):
                 if advanced_mode:
@@ -365,8 +490,8 @@ if run:
                 for _, h in headlines.iterrows():
                     title = str(h.get("title", "")).strip()
                     url = str(h.get("url", "")).strip()
-                    src = str(h.get("source_name", "")).strip()
-                    dt = str(h.get("publishedAt", "")).strip()
+                    src = str(h.get("source_name", h.get("domain", ""))).strip()
+                    dt = str(h.get("publishedAt", h.get("seendate", ""))).strip()
 
                     if title and url:
                         st.markdown(f"- [{title}]({url})  \n  {src} | {dt}")
