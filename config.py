@@ -1,4 +1,5 @@
 # config.py
+import os
 
 CACHE_TTL_SECONDS = 3 * 3600  # 3 hours
 
@@ -6,6 +7,7 @@ TOP_N_DEFAULT = 5
 LOOKBACK_DAYS_NEWS_DEFAULT = 7
 LOOKBACK_DAYS_PRICE_DEFAULT = 30
 PREFILTER_N_DEFAULT = 25
+GNEWS_MAX_TICKERS_DEFAULT = 12
 MIN_AVG_DAILY_VOLUME_DEFAULT = 2_000_000
 
 WEIGHT_TONE_DEFAULT = 0.55
@@ -95,3 +97,8 @@ ALIASES = {
     "SILO": ["Siloam International Hospitals", "PT Siloam International Hospitals", "Siloam"],
     "HEAL": ["Medikaloka Hermina", "PT Medikaloka Hermina", "Hermina"],
 }
+
+# Optional Google Sheet source for watchlists
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
+GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()

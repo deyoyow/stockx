@@ -62,3 +62,7 @@ watchdog @ file:///C:/Users/dev-admin/buildout/croot/watchdog_1759968437007/work
 webencodings @ file:///C:/Users/dev-admin/buildout/croot/webencodings_1761938483125/work
 win_inet_pton @ file:///C:/miniconda3/conda-bld/win_inet_pton_1761746275387/work
 yfinance @ file:///home/conda/feedstock_root/build_artifacts/yfinance_1745889389907/work
+
+# Google Sheets
+gspread
+google-auth
