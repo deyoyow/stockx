@@ -24,3 +24,6 @@ disk_cache/
 # OS
 .DS_Store
 Thumbs.db
+
+secrets/
+*.json
