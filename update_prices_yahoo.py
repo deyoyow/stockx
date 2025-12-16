@@ -3,10 +3,12 @@
 Usage:
     python update_prices_yahoo.py [--lookback 120]
 
-This script pulls the watchlist from config.WATCHLIST (no .JK suffix), fetches
-prices sequentially with small sleeps, and writes a normalized CSV to
-`data/price_idx.csv`. If Yahoo Finance signals a rate limit, the script stops
-immediately and leaves any existing CSV untouched.
+This script pulls the watchlist from Google Sheets (all worksheet tabs) when
+configured, falling back to config.WATCHLIST (no .JK suffix). It fetches prices
+sequentially with small sleeps, appends new rows into `data/price_idx.csv`
+without duplicates, and rotates out an archive file if the CSV grows beyond
+10MB. If Yahoo Finance signals a rate limit, the script stops immediately and
+leaves any existing CSV untouched.
 """
 from __future__ import annotations
 
@@ -20,14 +22,32 @@ import yfinance as yf
 
 import config
 from data_idx import fetch_idx_prices_for_one
+from data_google import load_sheet_universes
 from data_prices import normalize_price_frame
 
 DATA_PATH = Path(__file__).resolve().parent / "data" / "price_idx.csv"
+MAX_BYTES = 10 * 1024 * 1024
 
 
 def _is_rate_limit_error(msg: str) -> bool:
     msg_low = str(msg).lower()
     return "rate limit" in msg_low or "too many requests" in msg_low or "429" in msg_low
+
+
+def _load_watchlist_from_sheet() -> Tuple[List[str], str | None]:
+    universes, err = load_sheet_universes(
+        sheet_id=config.GOOGLE_SHEET_ID,
+        creds_path=config.GOOGLE_SERVICE_ACCOUNT_FILE,
+        creds_json=config.GOOGLE_SERVICE_ACCOUNT_JSON,
+    )
+    if err or not universes:
+        return [], err or None
+
+    tickers: List[str] = []
+    for vals in universes.values():
+        tickers.extend([v.strip().upper() for v in vals if v])
+    tickers = sorted(set(tickers))
+    return tickers, None
 
 
 def _fetch_one_yahoo(ticker_jk: str, lookback_days: int) -> Tuple[pd.DataFrame, str | None]:
@@ -58,7 +78,13 @@ def _fetch_one_yahoo(ticker_jk: str, lookback_days: int) -> Tuple[pd.DataFrame, 
 
 
 def update_prices(lookback_days: int) -> None:
-    tickers = [t.strip().upper() for t in config.WATCHLIST if t and str(t).strip()]
+    sheet_tickers, sheet_err = _load_watchlist_from_sheet()
+    if sheet_tickers:
+        print(f"Loaded {len(sheet_tickers)} tickers from Google Sheet across all tabs.")
+    elif sheet_err:
+        print(f"Sheet watchlist unavailable: {sheet_err}. Falling back to config.WATCHLIST")
+
+    tickers = sheet_tickers or [t.strip().upper() for t in config.WATCHLIST if t and str(t).strip()]
     tickers_jk = [f"{t}.JK" for t in tickers]
 
     frames: List[pd.DataFrame] = []
@@ -101,8 +127,44 @@ def update_prices(lookback_days: int) -> None:
         return
 
     DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    combined.to_csv(DATA_PATH, index=False)
-    print(f"Wrote {len(combined)} rows to {DATA_PATH}.")
+
+    existing = pd.DataFrame()
+    if DATA_PATH.exists():
+        try:
+            existing = pd.read_csv(DATA_PATH)
+            existing = normalize_price_frame(existing)
+        except Exception:
+            existing = pd.DataFrame()
+
+    merged = pd.concat([existing, combined], ignore_index=True)
+    merged = normalize_price_frame(merged)
+    if merged is None or merged.empty:
+        print("Merged data unusable; CSV not updated.")
+        return
+
+    merged = merged.drop_duplicates(subset=["ticker", "date"], keep="last")
+    merged.sort_values(["ticker", "date"], inplace=True)
+
+    # Size-aware rotation
+    csv_bytes = len(merged.to_csv(index=False).encode("utf-8"))
+    if csv_bytes > MAX_BYTES:
+        archive_path = DATA_PATH.with_name(
+            f"{DATA_PATH.stem}_{pd.Timestamp.utcnow():%Y%m%d%H%M%S}{DATA_PATH.suffix}"
+        )
+        merged.to_csv(archive_path, index=False)
+        print(f"Archive written to {archive_path} (full dataset, {csv_bytes/1_048_576:.2f} MB).")
+
+        # Trim oldest rows until under limit for the working CSV
+        trimmed = merged.copy()
+        while len(trimmed) > 0 and len(trimmed.to_csv(index=False).encode("utf-8")) > MAX_BYTES:
+            cutoff = max(1, int(len(trimmed) * 0.9))
+            trimmed = trimmed.iloc[len(trimmed) - cutoff :]
+
+        trimmed.to_csv(DATA_PATH, index=False)
+        print(f"Working price_idx.csv trimmed to {len(trimmed)} rows to stay under 10MB.")
+    else:
+        merged.to_csv(DATA_PATH, index=False)
+        print(f"Wrote {len(merged)} rows to {DATA_PATH}.")
 
     if failed:
         print("No data for: " + ", ".join(failed))

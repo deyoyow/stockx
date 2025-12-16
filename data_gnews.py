@@ -134,27 +134,29 @@ def fetch_gnews_articles(
       source_group, ticker
     """
     t = ticker.strip().upper()
-    q = query.strip()
-    max_results = int(max_results)
+    n = max(1, int(max_results))
+    if n > 10:
+        n = 10
+        if errors is not None:
+            errors.append("GNews max_results capped at 10 (free tier limit).")
 
-    cache_key = f"pse|t={t}|q={q}|d={int(lookback_days)}|n={max_results}|lang={lang}"
-    cached = cache.get("pse_articles", cache_key, ttl_seconds=ttl_seconds)
+    cache_key = f"gnews|t={t}|q={query}|days={int(lookback_days)}|n={n}|lang={lang}"
+    cached = cache.get("gnews_articles", cache_key, ttl_seconds=ttl_seconds)
     if isinstance(cached, pd.DataFrame) and not cached.empty:
         return cached
 
     if not api_key:
-        # Caller passes whatever is in GNEWS_API_KEY; if it's empty, just bail.
-        return pd.DataFrame()
-    if not PSE_SEARCH_ENGINE_ID:
         if errors is not None:
-            errors.append("PSE_SEARCH_ENGINE_ID not set; news search backend is disabled.")
+            errors.append("GNEWS_API_KEY missing; skipping request.")
         return pd.DataFrame()
 
     params = {
-        "key": api_key,
-        "cx": PSE_SEARCH_ENGINE_ID,
-        "q": q,
-        "num": min(max_results, 10),
+        "q": query,
+        "lang": lang,
+        "from": from_dt,
+        "to": to_dt,
+        "max": int(n),
+        "token": api_key,
     }
 
     # dateRestrict supports dN / wN / mN / yN; we use days.
@@ -166,16 +168,22 @@ def fetch_gnews_articles(
         r = requests.get(CSE_ENDPOINT, params=params, timeout=20)
         if r.status_code != 200:
             if errors is not None:
-                errors.append(f"Custom Search API HTTP {r.status_code} for {t}: {r.text[:200]}")
+                msg = r.text.strip()
+                msg = msg[:300] if len(msg) > 300 else msg
+                errors.append(
+                    f"GNews returned HTTP {r.status_code} for {t}: {msg or 'no response body'}"
+                )
             return pd.DataFrame()
         data = r.json()
-    except Exception as exc:
+    except Exception as e:
         if errors is not None:
-            errors.append(f"Custom Search API error for {t}: {exc}")
+            errors.append(f"Request to GNews failed for {t}: {e}")
         return pd.DataFrame()
 
-    items = data.get("items") or []
-    if not items:
+    articles = data.get("articles", []) or []
+    if not articles:
+        if errors is not None:
+            errors.append(f"GNews returned zero articles for {t} (query: {query}).")
         return pd.DataFrame()
 
     rows: list[dict] = []

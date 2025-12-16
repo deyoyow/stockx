@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+import altair as alt
 
 import config
 from cache_disk import DiskCache
@@ -16,7 +17,8 @@ from data_gdelt import (
     fetch_latest_headlines as fetch_gdelt_headlines,
 )
 from data_gnews import fetch_latest_headlines
-from data_prices import load_prices_from_csv
+from data_google import load_sheet_universes
+from data_prices import load_prices_from_csv, normalize_price_frame
 from data_x import build_x_query, fetch_x_posts
 from scoring import (
     compute_price_features,
@@ -27,6 +29,10 @@ from scoring import (
 )
 from data_idx import fetch_idx_prices
 
+
+ROOT_DIR = Path(__file__).resolve().parent
+LOCAL_PRICE_CSV_PATH = ROOT_DIR / "data" / "price_idx.csv"
+PORTFOLIO_CSV_PATH = ROOT_DIR / "data" / "portfolio.csv"
 
 ROOT_DIR = Path(__file__).resolve().parent
 LOCAL_PRICE_CSV_PATH = ROOT_DIR / "data" / "price_idx.csv"
@@ -51,6 +57,7 @@ cache = DiskCache(ROOT_DIR / ".cache")
 
 st.title("IDX Sentiment Screener")
 st.caption("News-driven ranking with optional CSV prices and disk caching.")
+
 
 
 
@@ -194,11 +201,6 @@ with st.sidebar:
         w_vol = config.WEIGHT_NEWS_VOL_DEFAULT
         w_mom = config.WEIGHT_MOMENTUM_DEFAULT
 
-
-def _parse_ticker_text(val: str) -> list[str]:
-    return [t.strip().upper() for t in val.splitlines() if t.strip()]
-
-
 def _build_src_map(tickers_jk: list[str], present: set[str], label: str) -> dict[str, str]:
     src_map = {t: "none" for t in tickers_jk}
     for t in tickers_jk:
@@ -216,6 +218,40 @@ def _filter_prices_by_lookback(df: pd.DataFrame, lookback_days_price: int) -> pd
     return df[df["date"] >= start]
 
 
+@st.cache_data(ttl=900)
+def _load_universes_from_sheet_cached() -> tuple[dict[str, list[str]], str | None]:
+    return load_sheet_universes(
+        sheet_id=config.GOOGLE_SHEET_ID,
+        creds_path=config.GOOGLE_SERVICE_ACCOUNT_FILE,
+        creds_json=config.GOOGLE_SERVICE_ACCOUNT_JSON,
+    )
+
+
+@st.cache_data(ttl=300)
+def _load_full_price_csv(path: Path) -> pd.DataFrame:
+    if path is None or not path.exists():
+        return pd.DataFrame()
+    try:
+        df_raw = pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+    return normalize_price_frame(df_raw)
+
+
+def _render_price_chart(df: pd.DataFrame, title: str) -> None:
+    if df is None or df.empty:
+        st.info(f"No price data available for {title} range.")
+        return
+
+    chart = (
+        alt.Chart(df)
+        .mark_line()
+        .encode(x="date:T", y="close:Q", color="ticker:N")
+        .properties(title=title)
+    )
+    st.altair_chart(chart, theme=None)
+
+
 tab_screener, tab_scraper, tab_portfolio = st.tabs([
     "Screener",
     "Prices & Scraper",
@@ -228,18 +264,58 @@ tab_screener, tab_scraper, tab_portfolio = st.tabs([
 # ----------------------------
 with tab_screener:
     st.subheader("IDX Sentiment Screener")
-    universe_text = st.text_area(
-        "Universe (IDX tickers, one per line, no .JK)",
-        value="\n".join(config.WATCHLIST),
-        height=180,
-    )
+    universes, sheet_err = _load_universes_from_sheet_cached()
+    if sheet_err:
+        st.warning(sheet_err)
 
-    tickers = _parse_ticker_text(universe_text)
+    if not universes:
+        st.info("Using fallback watchlist from config.WATCHLIST because no Google Sheet data is available.")
+        universes = {"Default": config.WATCHLIST}
+
+    selected_universe = st.session_state.get("selected_universe")
+    if not selected_universe or selected_universe not in universes:
+        selected_universe = next(iter(universes))
+
+    st.write("Select a universe (worksheet tab):")
+    btn_cols = st.columns(min(4, len(universes))) if universes else []
+    for idx, name in enumerate(universes.keys()):
+        col = btn_cols[idx % len(btn_cols)]
+        if col.button(name, key=f"univ_btn_{name}"):
+            selected_universe = name
+
+    st.session_state["selected_universe"] = selected_universe
+
+    tickers = universes.get(selected_universe, [])
     tickers_jk = [f"{t}.JK" for t in tickers]
+    st.caption(f"Selected universe: {selected_universe} ({len(tickers)} tickers)")
+
+    price_preview_df = _load_full_price_csv(LOCAL_PRICE_CSV_PATH)
+    if not price_preview_df.empty:
+        price_preview_df = price_preview_df[price_preview_df["ticker"].isin(tickers_jk)]
+    if not price_preview_df.empty:
+        price_preview_df["date"] = pd.to_datetime(price_preview_df["date"], errors="coerce")
+        latest_dt = price_preview_df["date"].max()
+        ranges = [
+            ("1 day", latest_dt - pd.Timedelta(days=1)),
+            ("3 days", latest_dt - pd.Timedelta(days=3)),
+            ("All time", None),
+        ]
+        st.subheader("Price preview for selected universe")
+        for title, start_dt in ranges:
+            df_range = price_preview_df
+            if start_dt is not None:
+                df_range = price_preview_df[price_preview_df["date"] >= start_dt]
+            _render_price_chart(df_range, title)
+    else:
+        st.info("No cached prices available to plot. Run the offline updater to populate data/price_idx.csv.")
 
     run = st.button("Run screening", type="primary")
 
     if run:
+        if not tickers_jk:
+            st.error("No tickers available. Ensure the Google Sheet contains tickers or update config.WATCHLIST.")
+            st.stop()
+
         # Progress UI
         pb_slot = st.empty()
         pbar = pb_slot.progress(0, text="Starting...")
@@ -368,58 +444,52 @@ with tab_screener:
                 if (row.get("gnews_buzz", 0) == 0 and pd.isna(row.get("gnews_sent")))
             ]
 
-            # NEW: only use GDELT fallback in advanced mode
-            if missing_tickers and advanced_mode:
+            if missing_tickers and gnews_errors is not None:
                 gnews_errors.append(
                     f"Falling back to GDELT for {len(missing_tickers)} tickers with no GNews coverage."
                 )
 
-                def gdelt_progress(done: int, total: int, ticker: str | None = None) -> None:
-                    total = max(1, int(total))
-                    done = int(done)
-                    pct = 30 + int(15 * (done / total))  # 30..45
-                    name = f" ({ticker})" if ticker else ""
-                    set_progress(pct, f"GDELT fallback {done}/{total}{name}...")
+            def gdelt_progress(done: int, total: int, ticker: str | None = None) -> None:
+                total = max(1, int(total))
+                done = int(done)
+                pct = 30 + int(15 * (done / total))  # 30..45
+                name = f" ({ticker})" if ticker else ""
+                set_progress(pct, f"GDELT fallback {done}/{total}{name}...")
 
-                gdelt_rows = []
-                total_missing = max(1, len(missing_tickers))
-                for i, t in enumerate(missing_tickers, start=1):
-                    gdelt_progress(i, total_missing, t)
-                    q = build_gdelt_query(t, config.ALIASES)
-                    metrics = fetch_gdelt_metrics(
-                        query=q,
-                        lookback_days_news=int(lookback_news),
-                        include_vol=True,
-                        cache=cache,
-                        ttl_seconds=config.CACHE_TTL_SECONDS,
-                    )
-                    gdelt_rows.append(
-                        {
-                            "ticker": t,
-                            "kw_used": q,
-                            "gnews_sent": metrics.get("tone_latest", np.nan),
-                            "gnews_buzz": metrics.get("vol_latest", 0),
-                        }
-                    )
+            gdelt_rows = []
+            total_missing = max(1, len(missing_tickers))
+            for i, t in enumerate(missing_tickers, start=1):
+                gdelt_progress(i, total_missing, t)
+                q = build_gdelt_query(t, config.ALIASES)
+                metrics = fetch_gdelt_metrics(
+                    query=q,
+                    lookback_days_news=int(lookback_news),
+                    include_vol=True,
+                    cache=cache,
+                    ttl_seconds=config.CACHE_TTL_SECONDS,
+                )
+                gdelt_rows.append(
+                    {
+                        "ticker": t,
+                        "kw_used": q,
+                        "gnews_sent": metrics.get("tone_latest", np.nan),
+                        "gnews_buzz": metrics.get("vol_latest", 0),
+                    }
+                )
 
-                if gdelt_rows:
-                    gdf = gnews_df.set_index("ticker")
-                    for r in gdelt_rows:
-                        t = r["ticker"]
-                        if t not in gdf.index:
-                            gdf.loc[t] = {"kw_used": "", "gnews_sent": np.nan, "gnews_buzz": 0}
-                        if pd.isna(gdf.loc[t].get("gnews_sent")) and gdf.loc[t].get("gnews_buzz", 0) == 0:
-                            gdf.loc[t, ["kw_used", "gnews_sent", "gnews_buzz"]] = [
-                                r["kw_used"],
-                                r["gnews_sent"],
-                                r["gnews_buzz"],
-                            ]
-                    gnews_df = gdf.reset_index()
-            # elif missing_tickers and not advanced_mode:
-            #     gnews_errors.append(
-            #         f"Skipped GDELT fallback for {len(missing_tickers)} tickers (Advanced mode is off)."
-            #     )
-
+            if gdelt_rows:
+                gdf = gnews_df.set_index("ticker")
+                for r in gdelt_rows:
+                    t = r["ticker"]
+                    if t not in gdf.index:
+                        gdf.loc[t] = {"kw_used": "", "gnews_sent": np.nan, "gnews_buzz": 0}
+                    if pd.isna(gdf.loc[t].get("gnews_sent")) and gdf.loc[t].get("gnews_buzz", 0) == 0:
+                        gdf.loc[t, ["kw_used", "gnews_sent", "gnews_buzz"]] = [
+                            r["kw_used"],
+                            r["gnews_sent"],
+                            r["gnews_buzz"],
+                        ]
+                gnews_df = gdf.reset_index()
 
         merged = f.merge(gnews_df, on="ticker", how="left")
 

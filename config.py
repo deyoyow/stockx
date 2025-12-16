@@ -1,4 +1,5 @@
 # config.py
+import os
 
 CACHE_TTL_SECONDS = 3 * 3600  # 3 hours
 
@@ -96,3 +97,8 @@ ALIASES = {
     "SILO": ["Siloam International Hospitals", "PT Siloam International Hospitals", "Siloam"],
     "HEAL": ["Medikaloka Hermina", "PT Medikaloka Hermina", "Hermina"],
 }
+
+# Optional Google Sheet source for watchlists
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
+GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
